@@ -1,25 +1,97 @@
-import java.util.concurrent.*;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.entity.ContentType;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.util.EntityUtils;
+
+import java.io.IOException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 public class CrptApi {
-    private final TimeUnit timeUnit;
-    private final int requestLimit;
+    private final HttpClient httpClient;
+    private final ObjectMapper objectMapper;
+    private final Semaphore semaphore;
+    private final long delayMillis;
+    private final String url = "https://ismp.crpt.ru/api/v3/";
+
 
     public CrptApi(TimeUnit timeUnit, int requestLimit) {
         if (requestLimit <= 0) {
             throw new IllegalArgumentException("Request limit must be positive");
         }
 
-        this.timeUnit = timeUnit;
-        this.requestLimit = requestLimit;
+        this.delayMillis = timeUnit.toMillis(1) / requestLimit;
+        this.semaphore = new Semaphore(requestLimit);
+
+        this.httpClient = HttpClients.createDefault();
+
+        this.objectMapper = new ObjectMapper();
+        this.objectMapper.setSerializationInclusion(JsonInclude.Include.NON_NULL);
+
+        startPermitRefiller(requestLimit);
     }
 
+    public void createDocument(Document document, String signature) {
+        try {
+            semaphore.acquire();
+
+            String requestBody = objectMapper.writeValueAsString(document);
+
+            HttpPost request = new HttpPost(url);
+            request.setHeader("Content-Type", "application/json");
+            request.setHeader("Signature", signature);
+            request.setEntity(new StringEntity(requestBody, ContentType.APPLICATION_JSON));
+
+            HttpResponse response = httpClient.execute(request);
+
+            int statusCode = response.getStatusLine().getStatusCode();
+            if (statusCode >= 400) {
+                String responseBody = EntityUtils.toString(response.getEntity());
+                throw new ApiException("API request failed with status: " + statusCode + ". Response: " + responseBody);
+            }
+
+            EntityUtils.consume(response.getEntity());
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ApiException("Interrupted while waiting for rate limit", e);
+        } catch (JsonProcessingException e) {
+            throw new ApiException("Failed to serialize document to JSON", e);
+        } catch (IOException e) {
+            throw new ApiException("Failed to execute HTTP request", e);
+        }
+    }
+
+    private void startPermitRefiller(int requestLimit) {
+        Thread refillThread = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Thread.sleep(delayMillis);
+                    if (semaphore.availablePermits() < requestLimit) {
+                        semaphore.release();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        });
+        refillThread.setDaemon(true);
+        refillThread.start();
+    }
 
     public static class Document {
         private Description description;
         private String doc_id;
         private String doc_status;
         private String doc_type;
-        private boolean importRequest;
+        private Boolean importRequest;
         private String owner_inn;
         private String participant_inn;
         private String producer_inn;
@@ -57,8 +129,8 @@ public class CrptApi {
         public String getDoc_type() { return doc_type; }
         public void setDoc_type(String doc_type) { this.doc_type = doc_type; }
 
-        public boolean isImportRequest() { return importRequest; }
-        public void setImportRequest(boolean importRequest) { this.importRequest = importRequest; }
+        public Boolean getImportRequest() { return importRequest; }
+        public void setImportRequest(Boolean importRequest) { this.importRequest = importRequest; }
 
         public String getOwner_inn() { return owner_inn; }
         public void setOwner_inn(String owner_inn) { this.owner_inn = owner_inn; }
@@ -88,6 +160,8 @@ public class CrptApi {
     public static class Description {
         private String participantInn;
 
+        public Description() {}
+
         public Description(String participantInn) {
             this.participantInn = participantInn;
         }
@@ -106,6 +180,13 @@ public class CrptApi {
         private String tnved_code;
         private String uit_code;
         private String uitu_code;
+
+        public Product(String owner_inn, String producer_inn, String production_date, String tnved_code) {
+            this.owner_inn = owner_inn;
+            this.producer_inn = producer_inn;
+            this.production_date = production_date;
+            this.tnved_code = tnved_code;
+        }
 
         public Product(String certificate_document, String certificate_document_date,
                        String certificate_document_number, String owner_inn, String producer_inn,
@@ -149,103 +230,41 @@ public class CrptApi {
         public void setUitu_code(String uitu_code) { this.uitu_code = uitu_code; }
     }
 
-    private static class DocumentSerializer {
-        public static String toJson(Document document) {
-            StringBuilder sb = new StringBuilder();
-            sb.append("{");
-
-            sb.append("\"description\":{");
-            sb.append("\"participantInn\":\"").append(escapeJson(document.getDescription().getParticipantInn())).append("\"");
-            sb.append("},");
-
-            appendField(sb, "doc_id", document.getDoc_id(), true);
-            appendField(sb, "doc_status", document.getDoc_status(), true);
-            appendField(sb, "doc_type", document.getDoc_type(), true);
-            appendField(sb, "importRequest", String.valueOf(document.isImportRequest()), false);
-            appendField(sb, "owner_inn", document.getOwner_inn(), true);
-            appendField(sb, "participant_inn", document.getParticipant_inn(), true);
-            appendField(sb, "producer_inn", document.getProducer_inn(), true);
-            appendField(sb, "production_date", document.getProduction_date(), true);
-            appendField(sb, "production_type", document.getProduction_type(), true);
-
-            sb.append("\"products\":[");
-            if (document.getProducts() != null) {
-                for (int i = 0; i < document.getProducts().length; i++) {
-                    if (i > 0) sb.append(",");
-                    sb.append(productToJson(document.getProducts()[i]));
-                }
-            }
-            sb.append("],");
-
-            appendField(sb, "reg_date", document.getReg_date(), true);
-            appendField(sb, "reg_number", document.getReg_number(), false);
-
-            if (sb.charAt(sb.length() - 1) == ',') {
-                sb.setLength(sb.length() - 1);
-            }
-
-            sb.append("}");
-            return sb.toString();
+    public static class ApiException extends RuntimeException {
+        public ApiException(String message) {
+            super(message);
         }
 
-        private static String productToJson(Product product) {
-            StringBuilder sb = new StringBuilder();
-            sb.append("{");
-
-            appendField(sb, "certificate_document", product.getCertificate_document(), true);
-            appendField(sb, "certificate_document_date", product.getCertificate_document_date(), true);
-            appendField(sb, "certificate_document_number", product.getCertificate_document_number(), true);
-            appendField(sb, "owner_inn", product.getOwner_inn(), true);
-            appendField(sb, "producer_inn", product.getProducer_inn(), true);
-            appendField(sb, "production_date", product.getProduction_date(), true);
-            appendField(sb, "tnved_code", product.getTnved_code(), true);
-            appendField(sb, "uit_code", product.getUit_code(), true);
-            appendField(sb, "uitu_code", product.getUitu_code(), false);
-
-            if (sb.charAt(sb.length() - 1) == ',') {
-                sb.setLength(sb.length() - 1);
-            }
-
-            sb.append("}");
-            return sb.toString();
-        }
-
-        private static void appendField(StringBuilder sb, String name, String value, boolean comma) {
-            if (value != null) {
-                sb.append("\"").append(name).append("\":\"")
-                        .append(escapeJson(value)).append("\"");
-                if (comma) sb.append(",");
-            }
-        }
-
-        private static String escapeJson(String str) {
-            if (str == null) return "";
-            return str.replace("\\", "\\\\")
-                    .replace("\"", "\\\"")
-                    .replace("\b", "\\b")
-                    .replace("\f", "\\f")
-                    .replace("\n", "\\n")
-                    .replace("\r", "\\r")
-                    .replace("\t", "\\t");
+        public ApiException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
     public static void main(String[] args) {
         CrptApi crptApi = new CrptApi(TimeUnit.MINUTES, 10);
 
-        Product product1 = new Product("cert1", "2023-07-27", "123", "owner1",
-                "producer1", "2023-07-27", "tnved1", "uit1", "uitu1");
-        Product product2 = new Product("cert2", "2023-07-28", "456", "owner2",
-                "producer2", "2023-07-28", "tnved2", "uit2", "uitu2");
+        Product product1 = new Product("CONFORMITY_CERTIFICATE", "2023-07-27", "123", "770123456789",
+                "770987654321", "2023-07-27", "1234567890", "uit123456", "uitu123456");
+        Product product2 = new Product("CONFORMITY_DECLARATION", "2023-07-28", "456", "770123456789",
+                "770987654321", "2023-07-28", "0987654321", "uit654321", "uitu654321");
 
         Product[] products = new Product[]{product1, product2};
 
-        Document document = new Document("doc123", "approved", "LP_INTRODUCE_GOODS",
+        Document document = new Document("doc123", "IN_PROGRESS", "LP_INTRODUCE_GOODS",
                 "770123456789", "770123456789", "770987654321",
-                "2023-07-27", "OWN_PRODUCTION", products, "2023-07-27");
+                "2023-07-27", "OWN_PRODUCTION", products,
+                "2025-12-12");
 
-        document.setImportRequest(true);
-        document.setReg_number("reg123");
+        document.setImportRequest(false);
+        document.setReg_number("REG-" + System.currentTimeMillis());
 
+        String signature = "signature_base64";
+
+        try {
+            crptApi.createDocument(document, signature);
+        } catch (ApiException e) {
+            System.err.println( e.getMessage());
+            e.printStackTrace();
+        }
     }
 }
